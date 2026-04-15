@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useState } from "react";
+import { supabase } from "./lib/supabase.ts";
 
 type UserStatus = "active" | "inactive" | "expired";
 type UserRole = "admin" | "user";
@@ -14,6 +15,21 @@ type AdminUser = {
   startDate: string;
   endDate: string;
   createdAt: string;
+  accessActive: boolean;
+  subscriptionStatus: string;
+};
+
+type SupabaseUserRow = {
+  id: string;
+  email: string | null;
+  full_name: string | null;
+  phone: string | null;
+  plan: string | null;
+  role: string | null;
+  access_active: boolean | null;
+  subscription_status: string | null;
+  created_at: string | null;
+  current_period_end: string | null;
 };
 
 const colors = {
@@ -44,8 +60,6 @@ const colors = {
   blueText: "#5e84e8",
 };
 
-const mockUsers: AdminUser[] = [];
-
 function toStartOfDay(date: Date) {
   const d = new Date(date);
   d.setHours(0, 0, 0, 0);
@@ -57,16 +71,25 @@ function parseLocalDate(dateString: string) {
   return new Date(year, (month || 1) - 1, day || 1);
 }
 
+function toDateOnly(value?: string | null) {
+  if (!value) return new Date().toISOString().split("T")[0];
+  return value.slice(0, 10);
+}
+
 function getComputedStatus(user: AdminUser): UserStatus {
+  if (user.role === "admin") return "active";
+
   const today = toStartOfDay(new Date());
   const end = toStartOfDay(parseLocalDate(user.endDate));
 
-  if (user.status === "inactive") return "inactive";
+  if (!user.accessActive || user.subscriptionStatus === "inactive") return "inactive";
   if (end.getTime() < today.getTime()) return "expired";
   return "active";
 }
 
-function daysLeft(endDate: string) {
+function daysLeft(endDate: string, role?: UserRole) {
+  if (role === "admin") return 9999;
+
   const today = toStartOfDay(new Date());
   const end = toStartOfDay(parseLocalDate(endDate));
   const diff = end.getTime() - today.getTime();
@@ -100,6 +123,34 @@ function statusColors(status: UserStatus) {
   return { bg: colors.redBg, color: colors.redText };
 }
 
+function mapSupabaseUser(row: SupabaseUserRow): AdminUser {
+  const isAdmin = row.role === "admin";
+  const safeStartDate = toDateOnly(row.created_at);
+  const safeEndDate = isAdmin
+    ? "2099-12-31"
+    : toDateOnly(row.current_period_end || row.created_at);
+
+  const user: AdminUser = {
+    id: row.id,
+    name: row.full_name?.trim() || "Sin nombre",
+    email: row.email?.trim().toLowerCase() || "",
+    phone: row.phone?.trim() || "",
+    plan: isAdmin ? "Acceso ilimitado" : row.plan?.trim() || "Sin plan",
+    role: isAdmin ? "admin" : "user",
+    startDate: safeStartDate,
+    endDate: safeEndDate,
+    createdAt: row.created_at || new Date().toISOString(),
+    accessActive: isAdmin ? true : Boolean(row.access_active),
+    subscriptionStatus: isAdmin ? "active" : row.subscription_status || "inactive",
+    status: "inactive",
+  };
+
+  return {
+    ...user,
+    status: getComputedStatus(user),
+  };
+}
+
 function exportToCSV(users: AdminUser[]) {
   const headers = [
     "ID",
@@ -124,11 +175,11 @@ function exportToCSV(users: AdminUser[]) {
       user.email,
       user.phone,
       user.plan,
-      statusLabel(computedStatus),
+      user.role === "admin" ? "ADMIN" : statusLabel(computedStatus),
       user.role,
       user.startDate,
-      user.endDate,
-      String(daysLeft(user.endDate)),
+      user.role === "admin" ? "Ilimitado" : user.endDate,
+      user.role === "admin" ? "∞" : String(daysLeft(user.endDate, user.role)),
       user.createdAt,
     ];
   });
@@ -154,7 +205,10 @@ function exportToCSV(users: AdminUser[]) {
 }
 
 export default function AdminPanel() {
-  const [users, setUsers] = useState<AdminUser[]>(mockUsers);
+  const [users, setUsers] = useState<AdminUser[]>([]);
+  const [loadingUsers, setLoadingUsers] = useState(true);
+  const [loadError, setLoadError] = useState("");
+
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState<"all" | UserStatus>("all");
   const [roleFilter, setRoleFilter] = useState<"all" | UserRole>("all");
@@ -176,14 +230,37 @@ export default function AdminPanel() {
     plan: "",
   });
 
+  async function loadUsers() {
+    try {
+      setLoadingUsers(true);
+      setLoadError("");
+
+      const { data, error } = await supabase
+        .from("usuarios")
+        .select(
+          "id, email, full_name, phone, plan, role, access_active, subscription_status, created_at, current_period_end"
+        )
+        .order("created_at", { ascending: false });
+
+      if (error) {
+        throw error;
+      }
+
+      const mappedUsers = (data || []).map((row: SupabaseUserRow) =>
+        mapSupabaseUser(row)
+      );
+
+      setUsers(mappedUsers);
+    } catch (error) {
+      console.error("Error cargando usuarios:", error);
+      setLoadError("No se pudieron cargar los usuarios.");
+    } finally {
+      setLoadingUsers(false);
+    }
+  }
+
   useEffect(() => {
-    setUsers((prev) =>
-      prev.map((user) => {
-        const computedStatus = getComputedStatus(user);
-        if (computedStatus === user.status) return user;
-        return { ...user, status: computedStatus };
-      })
-    );
+    loadUsers();
   }, []);
 
   const filteredUsers = useMemo(() => {
@@ -237,7 +314,7 @@ export default function AdminPanel() {
     });
   }, [selectedUser]);
 
-  function updateUser(id: string, patch: Partial<AdminUser>) {
+  function updateUserLocal(id: string, patch: Partial<AdminUser>) {
     setUsers((prev) =>
       prev.map((user) => {
         if (user.id !== id) return user;
@@ -245,7 +322,7 @@ export default function AdminPanel() {
         const nextUser = { ...user, ...patch };
         return {
           ...nextUser,
-          status: getComputedStatus(nextUser),
+          status: getComputedStatus(nextUser as AdminUser),
         };
       })
     );
@@ -256,24 +333,8 @@ export default function AdminPanel() {
       const nextUser = { ...prev, ...patch };
       return {
         ...nextUser,
-        status: getComputedStatus(nextUser),
+        status: getComputedStatus(nextUser as AdminUser),
       };
-    });
-  }
-
-  function toggleUserStatus(user: AdminUser) {
-    const computedStatus = getComputedStatus(user);
-
-    if (computedStatus === "active") {
-      updateUser(user.id, { status: "inactive" });
-      return;
-    }
-
-    const end = parseLocalDate(user.endDate);
-    const today = toStartOfDay(new Date());
-
-    updateUser(user.id, {
-      status: end.getTime() < today.getTime() ? "expired" : "active",
     });
   }
 
@@ -297,27 +358,132 @@ export default function AdminPanel() {
     });
   }
 
-  function saveRowEdit(user: AdminUser) {
-    updateUser(user.id, {
-      name: rowEditForm.name.trim() || user.name,
-      phone: rowEditForm.phone.trim() || user.phone,
-      email: rowEditForm.email.trim() || user.email,
-      plan: rowEditForm.plan.trim() || user.plan,
-    });
+  async function toggleUserStatus(user: AdminUser) {
+    if (user.role === "admin") return;
 
-    setEditingUserId(null);
+    const computedStatus = getComputedStatus(user);
+
+    try {
+      if (computedStatus === "active") {
+        const { error } = await supabase
+          .from("usuarios")
+          .update({
+            access_active: false,
+            subscription_status: "inactive",
+          })
+          .eq("id", user.id);
+
+        if (error) throw error;
+
+        updateUserLocal(user.id, {
+          accessActive: false,
+          subscriptionStatus: "inactive",
+          status: "inactive",
+        });
+        return;
+      }
+
+      const end = parseLocalDate(user.endDate);
+      const today = toStartOfDay(new Date());
+
+      const nextSubscriptionStatus =
+        end.getTime() < today.getTime() ? "inactive" : "active";
+
+      const { error } = await supabase
+        .from("usuarios")
+        .update({
+          access_active: true,
+          subscription_status: nextSubscriptionStatus,
+        })
+        .eq("id", user.id);
+
+      if (error) throw error;
+
+      updateUserLocal(user.id, {
+        accessActive: true,
+        subscriptionStatus: nextSubscriptionStatus,
+        status: end.getTime() < today.getTime() ? "expired" : "active",
+      });
+    } catch (error) {
+      console.error("Error cambiando estado del usuario:", error);
+      alert("No se pudo actualizar el estado del usuario.");
+    }
   }
 
-  function saveProfileChanges() {
+  async function saveRowEdit(user: AdminUser) {
+    const nextName = rowEditForm.name.trim() || user.name;
+    const nextPhone = rowEditForm.phone.trim() || user.phone;
+    const nextEmail = rowEditForm.email.trim().toLowerCase() || user.email;
+    const nextPlan = user.role === "admin"
+      ? "Acceso ilimitado"
+      : rowEditForm.plan.trim() || user.plan;
+
+    try {
+      const updatePayload =
+        user.role === "admin"
+          ? {
+              full_name: nextName,
+              phone: nextPhone,
+              email: nextEmail,
+            }
+          : {
+              full_name: nextName,
+              phone: nextPhone,
+              email: nextEmail,
+              plan: nextPlan,
+            };
+
+      const { error } = await supabase
+        .from("usuarios")
+        .update(updatePayload)
+        .eq("id", user.id);
+
+      if (error) throw error;
+
+      updateUserLocal(user.id, {
+        name: nextName,
+        phone: nextPhone,
+        email: nextEmail,
+        plan: nextPlan,
+      });
+
+      setEditingUserId(null);
+    } catch (error) {
+      console.error("Error guardando fila:", error);
+      alert("No se pudieron guardar los cambios.");
+    }
+  }
+
+  async function saveProfileChanges() {
     if (!selectedUser) return;
 
-    updateUser(selectedUser.id, {
-      name: profileForm.name.trim(),
-      email: profileForm.email.trim(),
-      phone: profileForm.phone.trim(),
-    });
+    const nextName = profileForm.name.trim() || selectedUser.name;
+    const nextEmail = profileForm.email.trim().toLowerCase() || selectedUser.email;
+    const nextPhone = profileForm.phone.trim() || selectedUser.phone;
 
-    setIsEditingProfile(false);
+    try {
+      const { error } = await supabase
+        .from("usuarios")
+        .update({
+          full_name: nextName,
+          email: nextEmail,
+          phone: nextPhone,
+        })
+        .eq("id", selectedUser.id);
+
+      if (error) throw error;
+
+      updateUserLocal(selectedUser.id, {
+        name: nextName,
+        email: nextEmail,
+        phone: nextPhone,
+      });
+
+      setIsEditingProfile(false);
+    } catch (error) {
+      console.error("Error guardando perfil:", error);
+      alert("No se pudieron guardar los cambios del perfil.");
+    }
   }
 
   function cancelProfileChanges() {
@@ -331,8 +497,7 @@ export default function AdminPanel() {
 
     setIsEditingProfile(false);
   }
-
-  return (
+    return (
     <div style={pageStyle}>
       <div style={bgBubbleOneStyle} />
       <div style={bgBubbleTwoStyle} />
@@ -431,236 +596,284 @@ export default function AdminPanel() {
                 </select>
               </div>
 
-              <div style={tableScrollerStyle}>
-                <table style={tableStyle}>
-                  <thead>
-                    <tr>
-                      <th style={thStyle}>Cliente</th>
-                      <th style={thStyle}>Teléfono</th>
-                      <th style={thStyle}>Correo</th>
-                      <th style={thStyle}>Plan</th>
-                      <th style={thStyle}>Estado</th>
-                      <th style={thStyle}>Vence</th>
-                      <th style={thStyle}>Días</th>
-                    </tr>
-                  </thead>
+              {loadingUsers ? (
+                <div style={emptyStateStyle}>Cargando usuarios...</div>
+              ) : loadError ? (
+                <div style={emptyStateStyle}>{loadError}</div>
+              ) : (
+                <div style={tableScrollerStyle}>
+                  <table style={tableStyle}>
+                    <thead>
+                      <tr>
+                        <th style={thStyle}>Cliente</th>
+                        <th style={thStyle}>Teléfono</th>
+                        <th style={thStyle}>Correo</th>
+                        <th style={thStyle}>Plan</th>
+                        <th style={thStyle}>Estado</th>
+                        <th style={thStyle}>Vence</th>
+                        <th style={thStyle}>Días</th>
+                      </tr>
+                    </thead>
 
-                  <tbody>
-                    {filteredUsers.map((user) => {
-                      const computedStatus = getComputedStatus(user);
-                      const badge = statusColors(computedStatus);
-                      const left = daysLeft(user.endDate);
-                      const isEditing = editingUserId === user.id;
+                    <tbody>
+                      {filteredUsers.map((user) => {
+                        const computedStatus = getComputedStatus(user);
+                        const badge = statusColors(computedStatus);
+                        const left = daysLeft(user.endDate, user.role);
+                        const isEditing = editingUserId === user.id;
+                        const isAdmin = user.role === "admin";
 
-                      return (
-                        <tr
-                          key={user.id}
-                          style={trStyle}
-                          onClick={() => setSelectedUser(user)}
-                        >
-                          <td style={tdStyle}>
-                            <div style={nameCellStyle}>
-                              <div style={leftControlsWrapStyle}>
-                                <button
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    toggleUserStatus(user);
-                                  }}
-                                  style={{
-                                    ...toggleButtonStyle,
-                                    background:
-                                      computedStatus === "active"
-                                        ? "linear-gradient(180deg, #57b8ff 0%, #2563eb 100%)"
-                                        : "linear-gradient(180deg, #8a8a8a 0%, #5f5f5f 100%)",
-                                  }}
-                                  title={
-                                    computedStatus === "active"
-                                      ? "Desactivar"
-                                      : "Activar"
-                                  }
-                                >
-                                  <span
-                                    style={{
-                                      ...toggleLabelStyle,
-                                      left: computedStatus === "active" ? 14 : 42,
-                                    }}
-                                  >
-                                    {computedStatus === "active" ? "ON" : "OFF"}
-                                  </span>
-
-                                  <span
-                                    style={{
-                                      ...toggleKnobStyle,
-                                      transform:
-                                        computedStatus === "active"
-                                          ? "translateX(52px)"
-                                          : "translateX(0px)",
-                                    }}
-                                  />
-                                </button>
-
-                                <div style={actionsInlineStyle}>
-                                  {isEditing ? (
-                                    <>
-                                      <button
-                                        onClick={(e) => {
-                                          e.stopPropagation();
-                                          saveRowEdit(user);
-                                        }}
-                                        style={saveButtonStyle}
-                                        title="Guardar"
-                                      >
-                                        ✓
-                                      </button>
-
-                                      <button
-                                        onClick={(e) => {
-                                          e.stopPropagation();
-                                          cancelRowEdit();
-                                        }}
-                                        style={cancelButtonStyle}
-                                        title="Cancelar"
-                                      >
-                                        ✕
-                                      </button>
-                                    </>
+                        return (
+                          <tr
+                            key={user.id}
+                            style={trStyle}
+                            onClick={() => setSelectedUser(user)}
+                          >
+                            <td style={tdStyle}>
+                              <div style={nameCellStyle}>
+                                <div style={leftControlsWrapStyle}>
+                                  {isAdmin ? (
+                                    <div style={adminBadgeStyle}>ADMIN</div>
                                   ) : (
                                     <button
                                       onClick={(e) => {
                                         e.stopPropagation();
-                                        startRowEdit(user);
+                                        toggleUserStatus(user);
                                       }}
-                                      style={iconButtonStyle}
-                                      title="Editar nombre, teléfono, correo y plan"
+                                      style={{
+                                        ...toggleButtonStyle,
+                                        background:
+                                          computedStatus === "active"
+                                            ? "linear-gradient(180deg, #57b8ff 0%, #2563eb 100%)"
+                                            : "linear-gradient(180deg, #8a8a8a 0%, #5f5f5f 100%)",
+                                      }}
+                                      title={
+                                        computedStatus === "active"
+                                          ? "Desactivar"
+                                          : "Activar"
+                                      }
                                     >
-                                      ✎
+                                      <span
+                                        style={{
+                                          ...toggleLabelStyle,
+                                          left: computedStatus === "active" ? 14 : 42,
+                                        }}
+                                      >
+                                        {computedStatus === "active" ? "ON" : "OFF"}
+                                      </span>
+
+                                      <span
+                                        style={{
+                                          ...toggleKnobStyle,
+                                          transform:
+                                            computedStatus === "active"
+                                              ? "translateX(52px)"
+                                              : "translateX(0px)",
+                                        }}
+                                      />
                                     </button>
                                   )}
+
+                                  <div style={actionsInlineStyle}>
+                                    {isEditing ? (
+                                      <>
+                                        <button
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            saveRowEdit(user);
+                                          }}
+                                          style={saveButtonStyle}
+                                          title="Guardar"
+                                        >
+                                          ✓
+                                        </button>
+
+                                        <button
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            cancelRowEdit();
+                                          }}
+                                          style={cancelButtonStyle}
+                                          title="Cancelar"
+                                        >
+                                          ✕
+                                        </button>
+                                      </>
+                                    ) : (
+                                      <button
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          startRowEdit(user);
+                                        }}
+                                        style={iconButtonStyle}
+                                        title="Editar nombre, teléfono, correo y plan"
+                                      >
+                                        ✎
+                                      </button>
+                                    )}
+                                  </div>
+                                </div>
+
+                                <div style={nameContentStyle}>
+                                  {isEditing ? (
+                                    <input
+                                      value={rowEditForm.name}
+                                      onChange={(e) =>
+                                        setRowEditForm((prev) => ({
+                                          ...prev,
+                                          name: e.target.value,
+                                        }))
+                                      }
+                                      style={tableInputStyle}
+                                      onClick={(e) => e.stopPropagation()}
+                                    />
+                                  ) : (
+                                    <div style={dataBoxStyle}>{user.name}</div>
+                                  )}
+
+                                  <div style={subTextStyle}>
+                                    {isAdmin ? "Administrador" : "Usuario"}
+                                  </div>
                                 </div>
                               </div>
+                            </td>
 
-                              <div style={nameContentStyle}>
-                                {isEditing ? (
-                                  <input
-                                    value={rowEditForm.name}
-                                    onChange={(e) =>
-                                      setRowEditForm((prev) => ({
-                                        ...prev,
-                                        name: e.target.value,
-                                      }))
-                                    }
-                                    style={tableInputStyle}
-                                    onClick={(e) => e.stopPropagation()}
-                                  />
-                                ) : (
-                                  <div style={dataBoxStyle}>{user.name}</div>
-                                )}
+                            <td style={tdStyle}>
+                              {isEditing ? (
+                                <input
+                                  value={rowEditForm.phone}
+                                  onChange={(e) =>
+                                    setRowEditForm((prev) => ({
+                                      ...prev,
+                                      phone: e.target.value,
+                                    }))
+                                  }
+                                  style={tableInputStyle}
+                                  onClick={(e) => e.stopPropagation()}
+                                />
+                              ) : (
+                                <div style={dataBoxStyle}>{user.phone || "—"}</div>
+                              )}
+                            </td>
 
-                                <div style={subTextStyle}>
-                                  {user.role === "admin" ? "Administrador" : "Usuario"}
-                                </div>
-                              </div>
-                            </div>
-                          </td>
+                            <td style={tdStyle}>
+                              {isEditing ? (
+                                <input
+                                  value={rowEditForm.email}
+                                  onChange={(e) =>
+                                    setRowEditForm((prev) => ({
+                                      ...prev,
+                                      email: e.target.value,
+                                    }))
+                                  }
+                                  style={tableInputStyle}
+                                  onClick={(e) => e.stopPropagation()}
+                                />
+                              ) : (
+                                <div style={dataBoxStyle}>{user.email}</div>
+                              )}
+                            </td>
 
-                          <td style={tdStyle}>
-                            {isEditing ? (
-                              <input
-                                value={rowEditForm.phone}
-                                onChange={(e) =>
-                                  setRowEditForm((prev) => ({
-                                    ...prev,
-                                    phone: e.target.value,
-                                  }))
-                                }
-                                style={tableInputStyle}
-                                onClick={(e) => e.stopPropagation()}
-                              />
-                            ) : (
-                              <div style={dataBoxStyle}>{user.phone}</div>
-                            )}
-                          </td>
+                            <td style={tdStyle}>
+                              {isEditing ? (
+                                <input
+                                  value={rowEditForm.plan}
+                                  onChange={(e) =>
+                                    setRowEditForm((prev) => ({
+                                      ...prev,
+                                      plan: e.target.value,
+                                    }))
+                                  }
+                                  style={tableInputStyle}
+                                  onClick={(e) => e.stopPropagation()}
+                                  disabled={isAdmin}
+                                />
+                              ) : (
+                                <div style={dataBoxStyle}>{user.plan}</div>
+                              )}
+                            </td>
 
-                          <td style={tdStyle}>
-                            {isEditing ? (
-                              <input
-                                value={rowEditForm.email}
-                                onChange={(e) =>
-                                  setRowEditForm((prev) => ({
-                                    ...prev,
-                                    email: e.target.value,
-                                  }))
-                                }
-                                style={tableInputStyle}
-                                onClick={(e) => e.stopPropagation()}
-                              />
-                            ) : (
-                              <div style={dataBoxStyle}>{user.email}</div>
-                            )}
-                          </td>
+                            <td style={tdStyle}>
+                              {isAdmin ? (
+                                <span
+                                  style={{
+                                    ...statusBadgeStyle,
+                                    background: colors.blueBg,
+                                    color: colors.blueText,
+                                  }}
+                                >
+                                  ADMIN
+                                </span>
+                              ) : (
+                                <span
+                                  style={{
+                                    ...statusBadgeStyle,
+                                    background: badge.bg,
+                                    color: badge.color,
+                                  }}
+                                >
+                                  {statusLabel(computedStatus)}
+                                </span>
+                              )}
+                            </td>
 
-                          <td style={tdStyle}>
-                            {isEditing ? (
-                              <input
-                                value={rowEditForm.plan}
-                                onChange={(e) =>
-                                  setRowEditForm((prev) => ({
-                                    ...prev,
-                                    plan: e.target.value,
-                                  }))
-                                }
-                                style={tableInputStyle}
-                                onClick={(e) => e.stopPropagation()}
-                              />
-                            ) : (
-                              <div style={dataBoxStyle}>{user.plan}</div>
-                            )}
-                          </td>
+                            <td style={tdStyle}>
+                              {isAdmin ? (
+                                <>
+                                  <div style={nameTextStyleSmall}>Acceso ilimitado</div>
+                                  <div style={subTextStyle}>Administrador interno</div>
+                                </>
+                              ) : (
+                                <>
+                                  <div style={nameTextStyleSmall}>
+                                    {formatDate(user.endDate)}
+                                  </div>
+                                  <div style={subTextStyle}>
+                                    {formatDate(user.startDate)}
+                                  </div>
+                                </>
+                              )}
+                            </td>
 
-                          <td style={tdStyle}>
-                            <span
-                              style={{
-                                ...statusBadgeStyle,
-                                background: badge.bg,
-                                color: badge.color,
-                              }}
-                            >
-                              {statusLabel(computedStatus)}
-                            </span>
-                          </td>
+                            <td style={tdStyle}>
+                              {isAdmin ? (
+                                <span
+                                  style={{
+                                    ...daysPillStyle,
+                                    background: colors.blueBg,
+                                    color: colors.blueText,
+                                  }}
+                                >
+                                  ∞
+                                </span>
+                              ) : (
+                                <span
+                                  style={{
+                                    ...daysPillStyle,
+                                    background: left < 0 ? colors.redBg : colors.blueBg,
+                                    color: left < 0 ? colors.redText : colors.blueText,
+                                  }}
+                                >
+                                  {left}
+                                </span>
+                              )}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
 
-                          <td style={tdStyle}>
-                            <div style={nameTextStyleSmall}>{formatDate(user.endDate)}</div>
-                            <div style={subTextStyle}>{formatDate(user.startDate)}</div>
-                          </td>
-
-                          <td style={tdStyle}>
-                            <span
-                              style={{
-                                ...daysPillStyle,
-                                background:
-                                  left < 0 ? colors.redBg : colors.blueBg,
-                                color:
-                                  left < 0 ? colors.redText : colors.blueText,
-                              }}
-                            >
-                              {left}
-                            </span>
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-
-                {filteredUsers.length === 0 && (
-                  <div style={emptyStateStyle}>
-                    No se encontraron usuarios con esos filtros.
-                  </div>
-                )}
-              </div>
+                  {filteredUsers.length === 0 && (
+                    <div style={emptyStateStyle}>
+                      No se encontraron usuarios con esos filtros.
+                    </div>
+                  )}
+                </div>
+              )}
             </section>
-                        <aside style={detailPanelStyle}>
+
+            <aside style={detailPanelStyle}>
               {!selectedUser ? (
                 <div style={emptyDetailStyle}>
                   Selecciona un usuario para ver su detalle.
@@ -668,43 +881,51 @@ export default function AdminPanel() {
               ) : (
                 (() => {
                   const computedStatus = getComputedStatus(selectedUser);
-                  const selectedDaysLeft = daysLeft(selectedUser.endDate);
+                  const selectedDaysLeft = daysLeft(
+                    selectedUser.endDate,
+                    selectedUser.role
+                  );
+                  const isAdmin = selectedUser.role === "admin";
 
                   return (
                     <>
                       <div style={detailHeaderStyle}>
-                        <button
-                          onClick={() => toggleUserStatus(selectedUser)}
-                          style={{
-                            ...toggleButtonStyle,
-                            background:
-                              computedStatus === "active"
-                                ? "linear-gradient(180deg, #57b8ff 0%, #2563eb 100%)"
-                                : "linear-gradient(180deg, #8a8a8a 0%, #5f5f5f 100%)",
-                          }}
-                          title={
-                            computedStatus === "active" ? "Desactivar" : "Activar"
-                          }
-                        >
-                          <span
+                        {isAdmin ? (
+                          <div style={adminBadgeStyle}>ADMIN</div>
+                        ) : (
+                          <button
+                            onClick={() => toggleUserStatus(selectedUser)}
                             style={{
-                              ...toggleLabelStyle,
-                              left: computedStatus === "active" ? 14 : 42,
-                            }}
-                          >
-                            {computedStatus === "active" ? "ON" : "OFF"}
-                          </span>
-
-                          <span
-                            style={{
-                              ...toggleKnobStyle,
-                              transform:
+                              ...toggleButtonStyle,
+                              background:
                                 computedStatus === "active"
-                                  ? "translateX(52px)"
-                                  : "translateX(0px)",
+                                  ? "linear-gradient(180deg, #57b8ff 0%, #2563eb 100%)"
+                                  : "linear-gradient(180deg, #8a8a8a 0%, #5f5f5f 100%)",
                             }}
-                          />
-                        </button>
+                            title={
+                              computedStatus === "active" ? "Desactivar" : "Activar"
+                            }
+                          >
+                            <span
+                              style={{
+                                ...toggleLabelStyle,
+                                left: computedStatus === "active" ? 14 : 42,
+                              }}
+                            >
+                              {computedStatus === "active" ? "ON" : "OFF"}
+                            </span>
+
+                            <span
+                              style={{
+                                ...toggleKnobStyle,
+                                transform:
+                                  computedStatus === "active"
+                                    ? "translateX(52px)"
+                                    : "translateX(0px)",
+                              }}
+                            />
+                          </button>
+                        )}
 
                         <div style={{ flex: 1, minWidth: 0 }}>
                           <div style={detailNameStyle}>{selectedUser.name}</div>
@@ -782,33 +1003,41 @@ export default function AdminPanel() {
                         </div>
                       ) : (
                         <div style={detailInfoCardStyle}>
-                          <DetailRow label="Teléfono" value={selectedUser.phone} />
+                          <DetailRow label="Teléfono" value={selectedUser.phone || "—"} />
                           <DetailRow label="Plan" value={selectedUser.plan} />
                           <DetailRow
                             label="Rol"
-                            value={
-                              selectedUser.role === "admin"
-                                ? "Administrador"
-                                : "Usuario"
-                            }
+                            value={isAdmin ? "Administrador" : "Usuario"}
                           />
                           <DetailRow
                             label="Estado"
-                            value={statusLabel(computedStatus)}
+                            value={
+                              isAdmin ? "Acceso ilimitado" : statusLabel(computedStatus)
+                            }
                           />
                           <DetailRow
                             label="Inicio"
                             value={formatDate(selectedUser.startDate)}
                           />
-                          <DetailRow
-                            label="Vencimiento"
-                            value={formatDate(selectedUser.endDate)}
-                          />
-                          <DetailRow
-                            label="Días restantes"
-                            value={String(selectedDaysLeft)}
-                            noBorder
-                          />
+                          {isAdmin ? (
+                            <DetailRow
+                              label="Tipo"
+                              value="Interno"
+                              noBorder
+                            />
+                          ) : (
+                            <>
+                              <DetailRow
+                                label="Vencimiento"
+                                value={formatDate(selectedUser.endDate)}
+                              />
+                              <DetailRow
+                                label="Días restantes"
+                                value={String(selectedDaysLeft)}
+                                noBorder
+                              />
+                            </>
+                          )}
                         </div>
                       )}
                     </>
@@ -1255,6 +1484,21 @@ const daysPillStyle: React.CSSProperties = {
   fontSize: 12,
   fontWeight: 700,
   whiteSpace: "nowrap",
+};
+
+const adminBadgeStyle: React.CSSProperties = {
+  minWidth: 92,
+  height: 40,
+  borderRadius: 999,
+  display: "inline-flex",
+  alignItems: "center",
+  justifyContent: "center",
+  background: "linear-gradient(180deg, #111111 0%, #000000 100%)",
+  color: "#ffffff",
+  fontSize: 13,
+  fontWeight: 900,
+  letterSpacing: 0.5,
+  boxShadow: "0 6px 14px rgba(0,0,0,0.18)",
 };
 
 const iconButtonStyle: React.CSSProperties = {
