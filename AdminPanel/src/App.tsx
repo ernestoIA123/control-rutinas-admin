@@ -17,6 +17,7 @@ type AdminUser = {
   createdAt: string;
   accessActive: boolean;
   subscriptionStatus: string;
+  country: string;
 };
 
 type SupabaseUserRow = {
@@ -30,6 +31,23 @@ type SupabaseUserRow = {
   subscription_status: string | null;
   created_at: string | null;
   current_period_end: string | null;
+  country: string | null;
+};
+
+type PagoRow = {
+  id: string;
+  email: string | null;
+  status: string | null;
+  amount: number | null;
+  created_at: string | null;
+};
+
+type PagoAdmin = {
+  id: string;
+  email: string;
+  status: string;
+  amount: number;
+  createdAt: string;
 };
 
 const colors = {
@@ -143,11 +161,22 @@ function mapSupabaseUser(row: SupabaseUserRow): AdminUser {
     accessActive: isAdmin ? true : Boolean(row.access_active),
     subscriptionStatus: isAdmin ? "active" : row.subscription_status || "inactive",
     status: "inactive",
+    country: row.country || "Sin país",
   };
 
   return {
     ...user,
     status: getComputedStatus(user),
+  };
+}
+
+function mapPagoRow(row: PagoRow): PagoAdmin {
+  return {
+    id: row.id,
+    email: row.email?.trim().toLowerCase() || "",
+    status: row.status || "failed",
+    amount: Number(row.amount || 0),
+    createdAt: row.created_at || new Date().toISOString(),
   };
 }
 
@@ -208,6 +237,9 @@ export default function AdminPanel() {
   const [users, setUsers] = useState<AdminUser[]>([]);
   const [loadingUsers, setLoadingUsers] = useState(true);
   const [loadError, setLoadError] = useState("");
+  const [pagos, setPagos] = useState<PagoAdmin[]>([]);
+const [loadingPagos, setLoadingPagos] = useState(true);
+const [pagosError, setPagosError] = useState("");
 
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState<"all" | UserStatus>("all");
@@ -238,7 +270,8 @@ export default function AdminPanel() {
       const { data, error } = await supabase
         .from("usuarios")
         .select(
-          "id, email, full_name, phone, plan, role, access_active, subscription_status, created_at, current_period_end"
+
+          "id, email, full_name, phone, plan, role, access_active, subscription_status, created_at, current_period_end, country"
         )
         .order("created_at", { ascending: false });
 
@@ -260,8 +293,32 @@ export default function AdminPanel() {
   }
 
   useEffect(() => {
-    loadUsers();
-  }, []);
+  loadUsers();
+  loadPagos();
+}, []);
+async function loadPagos() {
+  try {
+    setLoadingPagos(true);
+    setPagosError("");
+
+    const { data, error } = await supabase
+      .from("pagos")
+      .select("id, email, status, amount, created_at")
+      .order("created_at", { ascending: false });
+
+    if (error) {
+      throw error;
+    }
+
+    const mappedPagos = (data || []).map((row: PagoRow) => mapPagoRow(row));
+    setPagos(mappedPagos);
+  } catch (error) {
+    console.error("Error cargando pagos:", error);
+    setPagosError("No se pudieron cargar los pagos.");
+  } finally {
+    setLoadingPagos(false);
+  }
+}
 
   const filteredUsers = useMemo(() => {
     const term = search.trim().toLowerCase();
@@ -292,8 +349,10 @@ export default function AdminPanel() {
     const expired = users.filter((u) => getComputedStatus(u) === "expired").length;
     const admins = users.filter((u) => u.role === "admin").length;
 
-    return { total, active, inactive, expired, admins };
-  }, [users]);
+    const failedPayments = pagos.filter((p) => p.status === "failed").length;
+
+return { total, active, inactive, expired, admins, failedPayments };
+  }, [users, pagos]);
 
   useEffect(() => {
     if (!selectedUser) return;
@@ -422,16 +481,16 @@ export default function AdminPanel() {
       const updatePayload =
         user.role === "admin"
           ? {
-              full_name: nextName,
-              phone: nextPhone,
-              email: nextEmail,
-            }
+            full_name: nextName,
+            phone: nextPhone,
+            email: nextEmail,
+          }
           : {
-              full_name: nextName,
-              phone: nextPhone,
-              email: nextEmail,
-              plan: nextPlan,
-            };
+            full_name: nextName,
+            phone: nextPhone,
+            email: nextEmail,
+            plan: nextPlan,
+          };
 
       const { error } = await supabase
         .from("usuarios")
@@ -497,7 +556,7 @@ export default function AdminPanel() {
 
     setIsEditingProfile(false);
   }
-    return (
+  return (
     <div style={pageStyle}>
       <div style={bgBubbleOneStyle} />
       <div style={bgBubbleTwoStyle} />
@@ -555,6 +614,7 @@ export default function AdminPanel() {
             <StatCard label="Activos" value={stats.active} tone="green" />
             <StatCard label="Inactivos" value={stats.inactive} tone="orange" />
             <StatCard label="Vencidos" value={stats.expired} tone="red" />
+            <StatCard label="Pagos rechazados" value={stats.failedPayments} tone="orange" />
           </div>
 
           <div style={dashboardGridStyle}>
@@ -608,6 +668,7 @@ export default function AdminPanel() {
                         <th style={thStyle}>Cliente</th>
                         <th style={thStyle}>Teléfono</th>
                         <th style={thStyle}>Correo</th>
+                        <th style={thStyle}>País</th>
                         <th style={thStyle}>Plan</th>
                         <th style={thStyle}>Estado</th>
                         <th style={thStyle}>Vence</th>
@@ -773,7 +834,9 @@ export default function AdminPanel() {
                                 <div style={dataBoxStyle}>{user.email}</div>
                               )}
                             </td>
-
+                            <td style={tdStyle}>
+                              <div style={dataBoxStyle}>{user.country || "—"}</div>
+                            </td>
                             <td style={tdStyle}>
                               {isEditing ? (
                                 <input
@@ -1044,6 +1107,61 @@ export default function AdminPanel() {
                   );
                 })()
               )}
+              <div style={{ marginTop: 18 }}>
+  <div
+    style={{
+      fontSize: 14,
+      fontWeight: 800,
+      color: "#111111",
+      marginBottom: 10,
+    }}
+  >
+    Pagos rechazados
+  </div>
+
+  {loadingPagos ? (
+    <div style={emptyStateStyle}>Cargando pagos...</div>
+  ) : pagosError ? (
+    <div style={emptyStateStyle}>{pagosError}</div>
+  ) : pagos.length === 0 ? (
+    <div style={emptyStateStyle}>No hay pagos rechazados.</div>
+  ) : (
+    <div
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        gap: 10,
+        maxHeight: 260,
+        overflowY: "auto",
+      }}
+    >
+      {pagos.filter((pago) => pago.status === "failed").map((pago) => (
+        <div
+          key={pago.id}
+          style={{
+            background: "#fff",
+            border: "1px solid #ececec",
+            borderRadius: 14,
+            padding: 12,
+          }}
+        >
+          <div style={{ fontWeight: 700, color: "#111111", marginBottom: 4 }}>
+            {pago.email || "Sin correo"}
+          </div>
+          <div style={{ fontSize: 12, color: "#8b8b8b", marginBottom: 4 }}>
+            Estado: {pago.status}
+          </div>
+          <div style={{ fontSize: 12, color: "#8b8b8b", marginBottom: 4 }}>
+            Monto: {pago.amount}
+          </div>
+          <div style={{ fontSize: 12, color: "#8b8b8b" }}>
+            Fecha: {new Date(pago.createdAt).toLocaleString("es-MX")}
+          </div>
+        </div>
+      ))}
+    </div>
+  )}
+</div>
             </aside>
           </div>
         </main>
