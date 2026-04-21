@@ -600,7 +600,7 @@ return { total, active, inactive, expired, admins, failedPayments };
 
                 <div>
                   <div style={appBrandLabelStyle}>Nombre de la app</div>
-                  <div style={appBrandTitleStyle}>APP GYM</div>
+                  <div style={appBrandTitleStyle}>Control de rutinas</div>
                   <div style={appBrandSubStyle}>
                     Panel de control de suscripciones activas
                   </div>
